@@ -1,8 +1,11 @@
+#![windows_subsystem = "windows"]
+
 mod tabs;
 
 use self::tabs::ChatMessage;
 use self::tabs::ChatTab;
 use self::tabs::SettingsTab;
+use anyhow::Context;
 use iced::alignment::Horizontal;
 use iced::alignment::Vertical;
 use iced::widget::Container;
@@ -14,6 +17,7 @@ use iced::Settings;
 use iced::Theme;
 use iced_aw::TabLabel;
 use iced_aw::Tabs;
+use tracing::info;
 
 const TAB_PADDING: u16 = 16;
 
@@ -132,10 +136,22 @@ impl From<Icon> for char {
     }
 }
 
-fn main() -> iced::Result {
+fn main() -> anyhow::Result<()> {
     // std::env::set_var("ICED_BACKEND", "tiny-skia");
     std::env::set_var("WGPU_POWER_PREF", "low");
     std::env::set_var("WGPU_BACKEND", "opengl");
 
-    State::run(Settings::default())
+    let appender = tracing_appender::rolling::never("", "simple-tiny-llama-gui.log");
+    let (non_blocking_appender, _guard) = tracing_appender::non_blocking(appender);
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking_appender).with_ansi(false)
+        .try_init()
+        .ok()
+        .context("failed to install global logger")?;
+
+    info!("starting application");
+
+    State::run(Settings::default())?;
+
+    Ok(())
 }
