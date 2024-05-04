@@ -14,6 +14,7 @@ use iced::Command;
 use iced::Element;
 use iced::Length;
 use iced::Settings;
+use iced::Subscription;
 use iced::Theme;
 use iced_aw::TabLabel;
 use iced_aw::Tabs;
@@ -61,7 +62,7 @@ impl Application for State {
     }
 
     fn title(&self) -> String {
-        "Simple TinyLLama GUI".to_string()
+        "Simple TinyLlama GUI".to_string()
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -93,6 +94,10 @@ impl Application for State {
 
     fn theme(&self) -> Self::Theme {
         Theme::SolarizedDark
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        self.chat_tab.subscription().map(Message::ChatTab)
     }
 }
 
@@ -144,14 +149,19 @@ fn main() -> anyhow::Result<()> {
     let appender = tracing_appender::rolling::never("", "simple-tiny-llama-gui.log");
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::fmt()
-        .with_writer(non_blocking_appender).with_ansi(false)
+        .with_writer(non_blocking_appender)
+        .with_ansi(false)
         .try_init()
         .ok()
         .context("failed to install global logger")?;
 
     info!("starting application");
 
-    State::run(Settings::default())?;
+    let mut settings = Settings::default();
+    settings
+        .fonts
+        .push(iced_aw::core::icons::BOOTSTRAP_FONT_BYTES.into());
+    State::run(settings)?;
 
     Ok(())
 }
