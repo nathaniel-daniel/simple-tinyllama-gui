@@ -1,4 +1,4 @@
-// #![windows_subsystem = "windows"]
+#![cfg_attr(debug_assertions, windows_subsystem = "windows")]
 
 mod model_manager;
 mod tabs;
@@ -16,7 +16,6 @@ use iced::Command;
 use iced::Element;
 use iced::Length;
 use iced::Settings;
-use iced::Subscription;
 use iced::Theme;
 use iced_aw::TabLabel;
 use iced_aw::Tabs;
@@ -71,11 +70,7 @@ impl Application for State {
 
                 Command::none()
             }
-            Message::ChatTab(message) => {
-                self.chat_tab.update(message);
-
-                Command::none()
-            }
+            Message::ChatTab(message) => self.chat_tab.update(message).map(Message::ChatTab),
         }
     }
 
@@ -93,10 +88,6 @@ impl Application for State {
 
     fn theme(&self) -> Self::Theme {
         Theme::SolarizedDark
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        self.chat_tab.subscription().map(Message::ChatTab)
     }
 }
 

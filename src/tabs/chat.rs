@@ -16,27 +16,40 @@ use iced::widget::TextInput;
 use iced::Command;
 use iced::Element;
 use iced::Length;
-use iced::Subscription;
 use iced_aw::Card;
 use iced_aw::Modal;
 use iced_aw::TabLabel;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::error;
+use tracing::info;
 
 const DEFAULT_PADDING: f32 = 5.0;
+
 const MODEL_USER: &str = "TheBloke";
 const MODEL_REPO: &str = "TinyLlama-1.1B-Chat-v0.3-GGUF";
 const MODEL_FILE: &str = "tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf";
 
+const TOKENIZER_USER: &str = "hf-internal-testing";
+const TOKENIZER_REPO: &str = "llama-tokenizer";
+const TOKENIZER_FILE: &str = "tokenizer.model";
+
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
-    ModelPath(Option<Arc<PathBuf>>),
+    ModelStatus {
+        model_path: Option<Arc<PathBuf>>,
+        tokenizer_path: Option<Arc<PathBuf>>,
+    },
 
     DownloadModel,
     DownloadModelError(Arc<anyhow::Error>),
     DownloadModelProgress(f32),
     DownloadModelOk(Arc<PathBuf>),
+
+    DownloadTokenizer,
+    DownloadTokenizerError(Arc<anyhow::Error>),
+    DownloadTokenizerProgress(f32),
+    DownloadTokenizerOk(Arc<PathBuf>),
 
     Input(String),
     SubmitInput,
@@ -51,8 +64,11 @@ pub struct ChatTab {
     input: String,
     history: Vec<(String, String)>,
 
-    model_path: Option<Option<Arc<PathBuf>>>,
+    fetching_model_status: bool,
+    model_path: Option<Arc<PathBuf>>,
     model_download_progress: Option<f32>,
+    tokenizer_path: Option<Arc<PathBuf>>,
+    tokenizer_download_progress: Option<f32>,
 
     error: Option<Arc<anyhow::Error>>,
 }
@@ -68,39 +84,68 @@ impl ChatTab {
                 input: String::new(),
                 history: Vec::new(),
 
+                fetching_model_status: true,
                 model_path: None,
                 model_download_progress: None,
+                tokenizer_path: None,
+                tokenizer_download_progress: None,
 
                 error: None,
             },
             Command::perform(
                 async move {
-                    model_manager
+                    let model_path = model_manager
                         .get_model_path(MODEL_USER.into(), MODEL_REPO.into(), MODEL_FILE.into())
-                        .await
+                        .await?;
+                    let tokenizer_path = model_manager
+                        .get_model_path(
+                            TOKENIZER_USER.into(),
+                            TOKENIZER_REPO.into(),
+                            TOKENIZER_FILE.into(),
+                        )
+                        .await?;
+
+                    anyhow::Ok((model_path, tokenizer_path))
                 },
                 |model_path| {
-                    let model_path = match model_path {
-                        Ok(model_path) => model_path.map(Arc::new),
+                    let (model_path, tokenizer_path) = match model_path {
+                        Ok((model_path, tokenizer_path)) => {
+                            (model_path.map(Arc::new), tokenizer_path.map(Arc::new))
+                        }
                         Err(error) => {
                             error!("{error:?}");
-                            None
+                            (None, None)
                         }
                     };
 
-                    ChatMessage::ModelPath(model_path)
+                    ChatMessage::ModelStatus {
+                        model_path,
+                        tokenizer_path,
+                    }
                 },
             ),
         )
     }
 
-    pub fn update(&mut self, message: ChatMessage) {
+    pub fn update(&mut self, message: ChatMessage) -> Command<ChatMessage> {
         match message {
-            ChatMessage::ModelPath(model_path) => {
-                self.model_path = Some(model_path);
+            ChatMessage::ModelStatus {
+                model_path,
+                tokenizer_path,
+            } => {
+                if self.fetching_model_status {
+                    info!("model_path = {:?}", model_path);
+                    info!("tokenizer_path = {:?}", tokenizer_path);
+
+                    self.model_path = model_path;
+                    self.tokenizer_path = tokenizer_path;
+
+                    self.fetching_model_status = false;
+                }
             }
             ChatMessage::DownloadModel => {
                 self.model_download_progress = Some(0.0);
+                return download_model(self.model_manager.clone());
             }
             ChatMessage::DownloadModelError(error) => {
                 error!("{error:?}");
@@ -112,7 +157,23 @@ impl ChatTab {
             }
             ChatMessage::DownloadModelOk(model_path) => {
                 self.model_download_progress = None;
-                self.model_path = Some(Some(model_path));
+                self.model_path = Some(model_path);
+            }
+            ChatMessage::DownloadTokenizer => {
+                self.tokenizer_download_progress = Some(0.0);
+                return download_tokenizer(self.model_manager.clone());
+            }
+            ChatMessage::DownloadTokenizerError(error) => {
+                error!("{error:?}");
+                self.error = Some(error);
+                self.tokenizer_download_progress = None;
+            }
+            ChatMessage::DownloadTokenizerProgress(progress) => {
+                self.tokenizer_download_progress = Some(progress);
+            }
+            ChatMessage::DownloadTokenizerOk(model_path) => {
+                self.tokenizer_download_progress = None;
+                self.tokenizer_path = Some(model_path);
             }
             ChatMessage::Input(input) => {
                 self.input = input;
@@ -125,19 +186,8 @@ impl ChatTab {
                 self.error = None;
             }
         }
-    }
 
-    pub fn subscription(&self) -> Subscription<ChatMessage> {
-        if self.model_download_progress.is_none() {
-            Subscription::none()
-        } else {
-            download_model(
-                self.model_manager.clone(),
-                MODEL_USER,
-                MODEL_REPO,
-                MODEL_FILE,
-            )
-        }
+        Command::none()
     }
 }
 
@@ -153,11 +203,6 @@ impl Tab for ChatTab {
     }
 
     fn content(&self) -> Element<'_, Self::Message> {
-        let no_model_downloaded = self
-            .model_path
-            .as_ref()
-            .map_or(true, |model_path| model_path.is_none());
-
         let chat_messages = Container::new(
             Scrollable::new(Column::with_children(
                 self.history
@@ -168,12 +213,12 @@ impl Tab for ChatTab {
             .height(Length::Fill),
         );
 
-        let model_upkeep = if self.model_path.is_none() {
+        let model_upkeep = if self.fetching_model_status {
             Some(
                 Container::new(Text::new("Checking model status..."))
                     .padding([DEFAULT_PADDING, 0.0]),
             )
-        } else if no_model_downloaded {
+        } else if self.model_path.is_none() {
             let element = match self.model_download_progress {
                 Some(progress) => Container::new(row![
                     Container::new(Text::new("Downloading Model..."))
@@ -196,6 +241,31 @@ impl Tab for ChatTab {
             };
 
             Some(element)
+        } else if self.tokenizer_path.is_none() {
+            let element = match self.tokenizer_download_progress {
+                Some(progress) => Container::new(row![
+                    Container::new(Text::new("Downloading Tokenizer..."))
+                        .align_y(Vertical::Center)
+                        .padding(DEFAULT_PADDING),
+                    ProgressBar::new(0.0..=1.0, progress),
+                    Container::new(Text::new(format!("{:.02}%", progress * 100.0)))
+                        .align_y(Vertical::Center)
+                        .padding(DEFAULT_PADDING)
+                ])
+                .padding([DEFAULT_PADDING, 0.0]),
+                None => Container::new(row![
+                    Container::new(Text::new(
+                        "No tokenizer detected. Download tokenizer to begin."
+                    ))
+                    .align_y(Vertical::Center)
+                    .padding(DEFAULT_PADDING),
+                    Button::new("Download Tokenizer").on_press(ChatMessage::DownloadTokenizer)
+                ])
+                .align_x(Horizontal::Center)
+                .padding([DEFAULT_PADDING, 0.0]),
+            };
+
+            Some(element)
         } else {
             None
         };
@@ -207,7 +277,7 @@ impl Tab for ChatTab {
             .height(Length::Fill);
 
         let mut text_input = TextInput::new("Start chatting...", &self.input);
-        if !no_model_downloaded {
+        if self.model_path.is_some() {
             text_input = text_input
                 .on_input(ChatMessage::Input)
                 .on_submit(ChatMessage::SubmitInput);
@@ -235,39 +305,17 @@ impl Tab for ChatTab {
     }
 }
 
-fn download_model(
-    model_manager: ModelManager,
-    user: &'static str,
-    repo: &'static str,
-    file: &'static str,
-) -> Subscription<ChatMessage> {
-    struct DownloadWorker {
-        user: &'static str,
-        repo: &'static str,
-        file: &'static str,
-    }
+fn download_model(model_manager: ModelManager) -> Command<ChatMessage> {
+    iced::command::channel(100, move |mut channel| async move {
+        let result = {
+            let channel = channel.clone();
 
-    impl std::hash::Hash for DownloadWorker {
-        fn hash<H>(&self, state: &mut H)
-        where
-            H: std::hash::Hasher,
-        {
-            std::any::TypeId::of::<DownloadWorker>().hash(state);
-            self.user.hash(state);
-            self.repo.hash(state);
-            self.file.hash(state);
-        }
-    }
-
-    iced::subscription::channel(
-        DownloadWorker { user, repo, file },
-        100,
-        move |mut channel| async move {
-            let result = {
-                let channel = channel.clone();
-
-                model_manager
-                    .download_model(user.into(), repo.into(), file.into(), move |progress| {
+            model_manager
+                .download_model(
+                    MODEL_USER.into(),
+                    MODEL_REPO.into(),
+                    MODEL_FILE.into(),
+                    move |progress| {
                         let mut channel = channel.clone();
 
                         async move {
@@ -275,27 +323,62 @@ fn download_model(
                                 .send(ChatMessage::DownloadModelProgress(progress))
                                 .await;
                         }
-                    })
-                    .await
-            };
+                    },
+                )
+                .await
+        };
 
-            match result {
-                Ok(model_path) => {
-                    let _ = channel
-                        .send(ChatMessage::DownloadModelOk(Arc::new(model_path)))
-                        .await;
-                }
-                Err(error) => {
-                    let error = Arc::new(error);
-                    let _ = channel
-                        .send(ChatMessage::DownloadModelError(error.clone()))
-                        .await;
-                }
+        match result {
+            Ok(model_path) => {
+                let _ = channel
+                    .send(ChatMessage::DownloadModelOk(Arc::new(model_path)))
+                    .await;
             }
-
-            iced::futures::future::pending().await
-        },
-    )
+            Err(error) => {
+                let error = Arc::new(error);
+                let _ = channel
+                    .send(ChatMessage::DownloadModelError(error.clone()))
+                    .await;
+            }
+        }
+    })
 }
 
-// https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model?download=true
+fn download_tokenizer(model_manager: ModelManager) -> Command<ChatMessage> {
+    iced::command::channel(100, move |mut channel| async move {
+        let result = {
+            let channel = channel.clone();
+
+            model_manager
+                .download_model(
+                    TOKENIZER_USER.into(),
+                    TOKENIZER_REPO.into(),
+                    TOKENIZER_FILE.into(),
+                    move |progress| {
+                        let mut channel = channel.clone();
+
+                        async move {
+                            let _ = channel
+                                .send(ChatMessage::DownloadTokenizerProgress(progress))
+                                .await;
+                        }
+                    },
+                )
+                .await
+        };
+
+        match result {
+            Ok(model_path) => {
+                let _ = channel
+                    .send(ChatMessage::DownloadTokenizerOk(Arc::new(model_path)))
+                    .await;
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                let _ = channel
+                    .send(ChatMessage::DownloadTokenizerError(error.clone()))
+                    .await;
+            }
+        }
+    })
+}
