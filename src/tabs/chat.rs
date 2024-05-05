@@ -1,7 +1,7 @@
 use crate::Icon;
 use crate::Message;
+use crate::ModelManager;
 use crate::Tab;
-use anyhow::Context;
 use iced::alignment::Horizontal;
 use iced::alignment::Vertical;
 use iced::futures::SinkExt;
@@ -13,23 +13,30 @@ use iced::widget::ProgressBar;
 use iced::widget::Scrollable;
 use iced::widget::Text;
 use iced::widget::TextInput;
+use iced::Command;
 use iced::Element;
 use iced::Length;
 use iced::Subscription;
 use iced_aw::Card;
 use iced_aw::Modal;
 use iced_aw::TabLabel;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
 use tracing::error;
+
+const DEFAULT_PADDING: f32 = 5.0;
+const MODEL_USER: &str = "TheBloke";
+const MODEL_REPO: &str = "TinyLlama-1.1B-Chat-v0.3-GGUF";
+const MODEL_FILE: &str = "tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf";
 
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
+    ModelPath(Option<Arc<PathBuf>>),
+
     DownloadModel,
     DownloadModelError(Arc<anyhow::Error>),
     DownloadModelProgress(f32),
-    DownloadModelComplete,
+    DownloadModelOk(Arc<PathBuf>),
 
     Input(String),
     SubmitInput,
@@ -39,46 +46,73 @@ pub enum ChatMessage {
 
 #[derive(Debug)]
 pub struct ChatTab {
+    model_manager: ModelManager,
+
     input: String,
     history: Vec<(String, String)>,
-    model_path: Arc<Path>,
-    downloaded_model: bool,
+
+    model_path: Option<Option<Arc<PathBuf>>>,
     model_download_progress: Option<f32>,
 
     error: Option<Arc<anyhow::Error>>,
 }
 
 impl ChatTab {
-    pub fn new() -> Self {
-        let model_path: Arc<Path> = Arc::from(Path::new("tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf"));
-        let downloaded_model = model_path.exists();
+    pub fn new() -> (Self, Command<ChatMessage>) {
+        let model_manager = ModelManager::new();
 
-        Self {
-            input: String::new(),
-            history: Vec::new(),
-            model_path,
-            downloaded_model,
-            model_download_progress: None,
+        (
+            Self {
+                model_manager: model_manager.clone(),
 
-            error: None,
-        }
+                input: String::new(),
+                history: Vec::new(),
+
+                model_path: None,
+                model_download_progress: None,
+
+                error: None,
+            },
+            Command::perform(
+                async move {
+                    model_manager
+                        .get_model_path(MODEL_USER.into(), MODEL_REPO.into(), MODEL_FILE.into())
+                        .await
+                },
+                |model_path| {
+                    let model_path = match model_path {
+                        Ok(model_path) => model_path.map(Arc::new),
+                        Err(error) => {
+                            error!("{error:?}");
+                            None
+                        }
+                    };
+
+                    ChatMessage::ModelPath(model_path)
+                },
+            ),
+        )
     }
 
     pub fn update(&mut self, message: ChatMessage) {
         match message {
+            ChatMessage::ModelPath(model_path) => {
+                self.model_path = Some(model_path);
+            }
             ChatMessage::DownloadModel => {
                 self.model_download_progress = Some(0.0);
             }
             ChatMessage::DownloadModelError(error) => {
                 error!("{error:?}");
                 self.error = Some(error);
+                self.model_download_progress = None;
             }
             ChatMessage::DownloadModelProgress(progress) => {
                 self.model_download_progress = Some(progress);
             }
-            ChatMessage::DownloadModelComplete => {
+            ChatMessage::DownloadModelOk(model_path) => {
                 self.model_download_progress = None;
-                self.downloaded_model = self.model_path.exists();
+                self.model_path = Some(Some(model_path));
             }
             ChatMessage::Input(input) => {
                 self.input = input;
@@ -97,7 +131,12 @@ impl ChatTab {
         if self.model_download_progress.is_none() {
             Subscription::none()
         } else {
-            download_worker(self.model_path.clone())
+            download_model(
+                self.model_manager.clone(),
+                MODEL_USER,
+                MODEL_REPO,
+                MODEL_FILE,
+            )
         }
     }
 }
@@ -114,7 +153,10 @@ impl Tab for ChatTab {
     }
 
     fn content(&self) -> Element<'_, Self::Message> {
-        const DEFAULT_PADDING: f32 = 5.0;
+        let no_model_downloaded = self
+            .model_path
+            .as_ref()
+            .map_or(true, |model_path| model_path.is_none());
 
         let chat_messages = Container::new(
             Scrollable::new(Column::with_children(
@@ -126,7 +168,12 @@ impl Tab for ChatTab {
             .height(Length::Fill),
         );
 
-        let model_upkeep = if !self.downloaded_model {
+        let model_upkeep = if self.model_path.is_none() {
+            Some(
+                Container::new(Text::new("Checking model status..."))
+                    .padding([DEFAULT_PADDING, 0.0]),
+            )
+        } else if no_model_downloaded {
             let element = match self.model_download_progress {
                 Some(progress) => Container::new(row![
                     Container::new(Text::new("Downloading Model..."))
@@ -159,11 +206,13 @@ impl Tab for ChatTab {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        let underlay = Column::new().push(chat_history).push(
-            TextInput::new("Start chatting...", &self.input)
+        let mut text_input = TextInput::new("Start chatting...", &self.input);
+        if !no_model_downloaded {
+            text_input = text_input
                 .on_input(ChatMessage::Input)
-                .on_submit(ChatMessage::SubmitInput),
-        );
+                .on_submit(ChatMessage::SubmitInput);
+        }
+        let underlay = Column::new().push(chat_history).push(text_input);
 
         let overlay = self.error.as_ref().map(|error| {
             Card::new(Text::new("Error"), Text::new(format!("{error:?}")))
@@ -186,145 +235,67 @@ impl Tab for ChatTab {
     }
 }
 
-fn download_worker(model_path: Arc<Path>) -> Subscription<ChatMessage> {
-    struct DownloadWorker;
-
-    enum State {
-        Starting,
-        Working {
-            response: reqwest::Response,
-            total: u64,
-            current: u64,
-            model_file: tokio::fs::File,
-        },
-        Finished,
+fn download_model(
+    model_manager: ModelManager,
+    user: &'static str,
+    repo: &'static str,
+    file: &'static str,
+) -> Subscription<ChatMessage> {
+    struct DownloadWorker {
+        user: &'static str,
+        repo: &'static str,
+        file: &'static str,
     }
 
-    let url = "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v0.3-GGUF/resolve/main/tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf?download=true";
-    // let url = "https://google.com";
-    let client = reqwest::Client::new();
+    impl std::hash::Hash for DownloadWorker {
+        fn hash<H>(&self, state: &mut H)
+        where
+            H: std::hash::Hasher,
+        {
+            std::any::TypeId::of::<DownloadWorker>().hash(state);
+            self.user.hash(state);
+            self.repo.hash(state);
+            self.file.hash(state);
+        }
+    }
+
     iced::subscription::channel(
-        std::any::TypeId::of::<DownloadWorker>(),
+        DownloadWorker { user, repo, file },
         100,
         move |mut channel| async move {
-            let mut state = State::Starting;
-            let tmp_model_path = nd_util::with_push_extension(&model_path, "tmp");
+            let result = {
+                let channel = channel.clone();
 
-            loop {
-                match &mut state {
-                    State::Starting => {
-                        let result = async {
-                            let response = client
-                                .get(url)
-                                .send()
-                                .await
-                                .and_then(|response| response.error_for_status())
-                                .context("failed to send request")?;
-                            let content_length = response
-                                .content_length()
-                                .context("missing content length")?;
+                model_manager
+                    .download_model(user.into(), repo.into(), file.into(), move |progress| {
+                        let mut channel = channel.clone();
 
-                            let model_file = tokio::fs::File::create(&tmp_model_path)
-                                .await
-                                .context("failed to open temporary model file")?;
-
-                            anyhow::Ok((response, content_length, model_file))
+                        async move {
+                            let _ = channel
+                                .send(ChatMessage::DownloadModelProgress(progress))
+                                .await;
                         }
+                    })
+                    .await
+            };
+
+            match result {
+                Ok(model_path) => {
+                    let _ = channel
+                        .send(ChatMessage::DownloadModelOk(Arc::new(model_path)))
                         .await;
-
-                        let (response, content_length, model_file) = match result {
-                            Ok(data) => data,
-                            Err(error) => {
-                                let error = Arc::new(error);
-                                let _ = channel
-                                    .send(ChatMessage::DownloadModelError(error.clone()))
-                                    .await;
-
-                                let _ = channel.send(ChatMessage::DownloadModelComplete).await;
-                                state = State::Finished;
-                                continue;
-                            }
-                        };
-
-                        state = State::Working {
-                            response,
-                            total: content_length,
-                            current: 0,
-                            model_file,
-                        };
-                    }
-                    State::Working {
-                        response,
-                        total,
-                        current,
-                        model_file,
-                    } => {
-                        let result = async {
-                            let maybe_chunk = response
-                                .chunk()
-                                .await
-                                .context("failed to download next chunk")?;
-
-                            match maybe_chunk {
-                                Some(chunk) => {
-                                    model_file
-                                        .write_all(&chunk)
-                                        .await
-                                        .context("failed to write to model file")?;
-
-                                    anyhow::Ok(Some(u64::try_from(chunk.len())?))
-                                }
-                                None => {
-                                    model_file
-                                        .flush()
-                                        .await
-                                        .context("failed to flush model file")?;
-                                    model_file
-                                        .sync_all()
-                                        .await
-                                        .context("failed to sync model file")?;
-                                    tokio::fs::rename(&tmp_model_path, &model_path)
-                                        .await
-                                        .context("failed to rename temporary model file")?;
-
-                                    Ok(None)
-                                }
-                            }
-                        }
+                }
+                Err(error) => {
+                    let error = Arc::new(error);
+                    let _ = channel
+                        .send(ChatMessage::DownloadModelError(error.clone()))
                         .await;
-
-                        let chunk_len = match result {
-                            Ok(chunk) => chunk,
-                            Err(error) => {
-                                let error = Arc::new(error);
-                                let _ = channel
-                                    .send(ChatMessage::DownloadModelError(error.clone()))
-                                    .await;
-
-                                let _ = channel.send(ChatMessage::DownloadModelComplete).await;
-                                state = State::Finished;
-                                continue;
-                            }
-                        };
-
-                        match chunk_len {
-                            Some(chunk_len) => {
-                                *current += chunk_len;
-                                let progress = (*current as f32) / (*total as f32);
-                                let _ = channel
-                                    .send(ChatMessage::DownloadModelProgress(progress))
-                                    .await;
-                            }
-                            None => {
-                                let _ = channel.send(ChatMessage::DownloadModelProgress(1.0)).await;
-                                let _ = channel.send(ChatMessage::DownloadModelComplete).await;
-                                state = State::Finished;
-                            }
-                        }
-                    }
-                    State::Finished => iced::futures::future::pending().await,
                 }
             }
+
+            iced::futures::future::pending().await
         },
     )
 }
+
+// https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model?download=true

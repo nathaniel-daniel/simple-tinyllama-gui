@@ -1,7 +1,9 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 
+mod model_manager;
 mod tabs;
 
+pub use self::model_manager::ModelManager;
 use self::tabs::ChatMessage;
 use self::tabs::ChatTab;
 use self::tabs::SettingsTab;
@@ -35,16 +37,6 @@ struct State {
     settings_tab: SettingsTab,
 }
 
-impl State {
-    pub fn new() -> Self {
-        Self {
-            active_tab: TabId::Chat,
-            chat_tab: ChatTab::new(),
-            settings_tab: SettingsTab::new(),
-        }
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum TabId {
     Chat,
@@ -58,7 +50,14 @@ impl Application for State {
     type Flags = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
-        (Self::default(), Command::none())
+        let (chat_tab, command) = ChatTab::new();
+        let state = Self {
+            active_tab: TabId::Chat,
+            chat_tab,
+            settings_tab: SettingsTab::new(),
+        };
+
+        (state, command.map(Message::ChatTab))
     }
 
     fn title(&self) -> String {
@@ -98,12 +97,6 @@ impl Application for State {
 
     fn subscription(&self) -> Subscription<Message> {
         self.chat_tab.subscription().map(Message::ChatTab)
-    }
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
