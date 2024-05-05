@@ -1,6 +1,7 @@
 use crate::Icon;
 use crate::Message;
 use crate::ModelManager;
+use crate::ModelRunner;
 use crate::Tab;
 use iced::alignment::Horizontal;
 use iced::alignment::Vertical;
@@ -32,7 +33,8 @@ const MODEL_FILE: &str = "tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf";
 
 const TOKENIZER_USER: &str = "hf-internal-testing";
 const TOKENIZER_REPO: &str = "llama-tokenizer";
-const TOKENIZER_FILE: &str = "tokenizer.model";
+const TOKENIZER_FILE: &str = "tokenizer.json";
+// const TOKENIZER_FILE: &str = "tokenizer.model";
 
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
@@ -51,6 +53,10 @@ pub enum ChatMessage {
     DownloadTokenizerProgress(f32),
     DownloadTokenizerOk(Arc<PathBuf>),
 
+    LoadModel,
+    LoadModelOk,
+    LoadModelError(Arc<anyhow::Error>),
+
     Input(String),
     SubmitInput,
 
@@ -60,6 +66,7 @@ pub enum ChatMessage {
 #[derive(Debug)]
 pub struct ChatTab {
     model_manager: ModelManager,
+    model_runner: ModelRunner,
 
     input: String,
     history: Vec<(String, String)>,
@@ -70,16 +77,21 @@ pub struct ChatTab {
     tokenizer_path: Option<Arc<PathBuf>>,
     tokenizer_download_progress: Option<f32>,
 
+    loaded_model: bool,
+    loading_model: bool,
+
     error: Option<Arc<anyhow::Error>>,
 }
 
 impl ChatTab {
     pub fn new() -> (Self, Command<ChatMessage>) {
         let model_manager = ModelManager::new();
+        let model_runner = ModelRunner::new();
 
         (
             Self {
                 model_manager: model_manager.clone(),
+                model_runner,
 
                 input: String::new(),
                 history: Vec::new(),
@@ -89,6 +101,9 @@ impl ChatTab {
                 model_download_progress: None,
                 tokenizer_path: None,
                 tokenizer_download_progress: None,
+
+                loaded_model: false,
+                loading_model: false,
 
                 error: None,
             },
@@ -174,6 +189,27 @@ impl ChatTab {
             ChatMessage::DownloadTokenizerOk(model_path) => {
                 self.tokenizer_download_progress = None;
                 self.tokenizer_path = Some(model_path);
+            }
+            ChatMessage::LoadModel => {
+                if let (Some(model_path), Some(tokenizer_path)) =
+                    (self.model_path.as_ref(), self.tokenizer_path.as_ref())
+                {
+                    self.loading_model = true;
+                    return load_model(
+                        self.model_runner.clone(),
+                        model_path.clone(),
+                        tokenizer_path.clone(),
+                    );
+                }
+            }
+            ChatMessage::LoadModelError(error) => {
+                error!("{error:?}");
+                self.error = Some(error);
+                self.loading_model = false;
+            }
+            ChatMessage::LoadModelOk => {
+                self.loaded_model = true;
+                self.loading_model = false;
             }
             ChatMessage::Input(input) => {
                 self.input = input;
@@ -263,6 +299,20 @@ impl Tab for ChatTab {
                 ])
                 .align_x(Horizontal::Center)
                 .padding([DEFAULT_PADDING, 0.0]),
+            };
+
+            Some(element)
+        } else if !self.loaded_model {
+            let element = if !self.loading_model {
+                Container::new(Button::new("Load Model").on_press(ChatMessage::LoadModel))
+                    .width(Length::Fill)
+                    .padding([DEFAULT_PADDING, 0.0])
+                    .align_x(Horizontal::Center)
+            } else {
+                Container::new(Text::new("Loading model..."))
+                    .width(Length::Fill)
+                    .padding([DEFAULT_PADDING, 0.0])
+                    .align_x(Horizontal::Center)
             };
 
             Some(element)
@@ -378,6 +428,27 @@ fn download_tokenizer(model_manager: ModelManager) -> Command<ChatMessage> {
                 let _ = channel
                     .send(ChatMessage::DownloadTokenizerError(error.clone()))
                     .await;
+            }
+        }
+    })
+}
+
+fn load_model(
+    model_runner: ModelRunner,
+    model_path: Arc<PathBuf>,
+    tokenizer_path: Arc<PathBuf>,
+) -> Command<ChatMessage> {
+    iced::command::channel(100, move |mut channel| async move {
+        let result = model_runner.load_model(model_path, tokenizer_path).await;
+        match result {
+            Ok(_) => {
+                let _ = channel.send(ChatMessage::LoadModelOk).await.is_ok();
+            }
+            Err(error) => {
+                let _ = channel
+                    .send(ChatMessage::LoadModelError(Arc::new(error)))
+                    .await
+                    .is_ok();
             }
         }
     })

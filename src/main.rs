@@ -1,9 +1,11 @@
-#![cfg_attr(debug_assertions, windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod model_manager;
+mod model_runner;
 mod tabs;
 
 pub use self::model_manager::ModelManager;
+pub use self::model_runner::ModelRunner;
 use self::tabs::ChatMessage;
 use self::tabs::ChatTab;
 use self::tabs::SettingsTab;

@@ -97,10 +97,8 @@ async fn task(mut rx: tokio::sync::mpsc::Receiver<Message>) {
                 tx,
             } => {
                 let data_dir = data_dir.clone();
-                tokio::spawn(async move {
-                    let result = get_model_path(data_dir, user, repo, file).await;
-                    let _ = tx.send(result).is_ok();
-                });
+                let result = get_model_path(data_dir, user, repo, file).await;
+                let _ = tx.send(result).is_ok();
             }
             Message::DownloadModel {
                 user,
@@ -111,11 +109,9 @@ async fn task(mut rx: tokio::sync::mpsc::Receiver<Message>) {
             } => {
                 let data_dir = data_dir.clone();
                 let client = client.clone();
-                tokio::spawn(async move {
-                    let result =
-                        download_model(data_dir, client, user, repo, file, progress_handler).await;
-                    let _ = tx.send(result).is_ok();
-                });
+                let result =
+                    download_model(data_dir, client, user, repo, file, progress_handler).await;
+                let _ = tx.send(result).is_ok();
             }
         }
     }
