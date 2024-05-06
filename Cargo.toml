@@ -13,8 +13,20 @@ iced = { version = "0.12.1", features = [ "tokio" ] }
 iced_aw = { git = "https://github.com/iced-rs/iced_aw", features = [ "tabs" ] }
 nd-util = { git = "https://github.com/nathaniel-daniel/nd-util-rs", version = "0.0.0" }
 reqwest = { version = "0.12.4", features = [ "rustls-tls", "http2" ], default-features = false }
-tokenizers = "0.19.1"
+tokenizers = { version = "0.19.1" }
 tokio = { version = "1.37.0", features = [ "rt", "fs" ] }
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
 tracing-subscriber = "0.3.18"
+
+[profile.dev.package.candle-core]
+opt-level = 3
+
+[profile.dev.package.candle-transformers]
+opt-level = 3
+
+[profile.dev.package.candle-nn]
+opt-level = 3
+
+[profile.dev.package.tokenizers]
+opt-level = 3

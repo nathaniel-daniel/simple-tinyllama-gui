@@ -3,6 +3,10 @@ mod token_output_stream;
 use self::token_output_stream::TokenOutputStream;
 use anyhow::ensure;
 use anyhow::Context;
+use candle_core::Device;
+use candle_core::Tensor;
+use candle_transformers::generation::LogitsProcessor;
+use candle_transformers::generation::Sampling;
 use candle_transformers::models::quantized_llama::ModelWeights;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +18,10 @@ enum Message {
     LoadModel {
         model_path: Arc<PathBuf>,
         tokenizer_path: Arc<PathBuf>,
+        tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    RunModel {
+        prompt: Box<str>,
         tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -48,6 +56,14 @@ impl ModelRunner {
 
         rx.await?
     }
+
+    pub async fn run_model(&self, prompt: Box<str>) -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.tx.send(Message::RunModel { prompt, tx }).await?;
+
+        rx.await?
+    }
 }
 
 impl Default for ModelRunner {
@@ -70,6 +86,10 @@ fn task(mut rx: tokio::sync::mpsc::Receiver<Message>) {
                 });
                 let _ = tx.send(result).is_ok();
             }
+            Message::RunModel { prompt, tx } => {
+                let result = run_model(loaded_model.as_mut(), &prompt);
+                let _ = tx.send(result).is_ok();
+            }
         }
     }
 }
@@ -80,7 +100,7 @@ fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let start_time = Instant::now();
 
-    let device = candle_core::Device::Cpu;
+    let device = Device::Cpu;
 
     info!("loading model \"{}\"", model_path.display());
 
@@ -115,4 +135,108 @@ fn load_model(
 struct LoadedModel {
     model_weights: ModelWeights,
     token_output_stream: TokenOutputStream,
+}
+
+fn run_model(model: Option<&mut LoadedModel>, prompt: &str) -> anyhow::Result<()> {
+    let sample_len: usize = 1024;
+    let temperature: f64 = 0.7;
+    let top_p = Some(0.9);
+    let top_k = Some(50);
+    let seed = 1234;
+    let repeat_penalty: f32 = 1.1;
+    let repeat_last_n = 64;
+
+    let device = Device::Cpu;
+
+    let model = model.context("missing model")?;
+    /*
+    let prompt = {
+        // ChatML
+        // https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md
+        let mut formatted = String::new();
+        formatted.push_str("<|im_start|>system\n");
+        formatted.push_str(prompt);
+        formatted.push_str("<|im_end|>\n");
+        formatted.push_str("<|im_start|>assistant\n");
+        formatted
+    };*/
+    let prompt = {
+        let mut formatted = String::new();
+        formatted.push_str("<|system|>\n");
+        formatted.push_str("You are a friendly assistant.</s>");
+        formatted.push_str("<|user|>\n");
+        formatted.push_str(prompt);
+        formatted.push_str("</s>");
+        formatted.push_str("<|assistant|>\n");
+        formatted
+    };
+    
+    println!("{prompt}");
+
+    let tokens = model
+        .token_output_stream
+        .tokenizer()
+        .encode(prompt.as_str(), true)
+        .map_err(anyhow::Error::msg)?;
+    let prompt_tokens = tokens.get_ids();
+
+    let mut logits_processor = {
+        let sampling = if temperature <= 0.0 {
+            Sampling::ArgMax
+        } else {
+            match (top_k, top_p) {
+                (None, None) => Sampling::All { temperature },
+                (Some(k), None) => Sampling::TopK { k, temperature },
+                (None, Some(p)) => Sampling::TopP { p, temperature },
+                (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+            }
+        };
+        LogitsProcessor::from_sampling(seed, sampling)
+    };
+
+    let eos_token = *model
+        .token_output_stream
+        .tokenizer()
+        .get_vocab(true)
+        .get("</s>")
+        .context("failed to get eos token")?;
+
+    let mut all_tokens = prompt_tokens.to_vec();
+    for index in 0..sample_len {
+        let context_size = if index > 0 { 1 } else { all_tokens.len() };
+        let start_pos = all_tokens.len().saturating_sub(context_size);
+
+        let input = Tensor::new(&all_tokens[start_pos..], &device)?.unsqueeze(0)?;
+        let logits = model
+            .model_weights
+            .forward(&input, start_pos)
+            .context("failed to forward model")?;
+        let logits = logits.squeeze(0)?;
+        let logits = if repeat_penalty == 1.0 {
+            logits
+        } else {
+            let start_at = all_tokens.len().saturating_sub(repeat_last_n);
+            candle_transformers::utils::apply_repeat_penalty(
+                &logits,
+                repeat_penalty,
+                &all_tokens[start_at..],
+            )?
+        };
+
+        let next_token = logits_processor.sample(&logits)?;
+        all_tokens.push(next_token);
+        
+        if next_token == eos_token {
+            break;
+        }
+
+        dbg!(next_token);
+        if let Some(t) = model.token_output_stream.next_token(next_token)? {
+            dbg!(t);
+        }
+    }
+    
+    dbg!("done");
+
+    Ok(())
 }

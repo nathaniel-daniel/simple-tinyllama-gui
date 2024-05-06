@@ -28,13 +28,20 @@ use tracing::info;
 const DEFAULT_PADDING: f32 = 5.0;
 
 const MODEL_USER: &str = "TheBloke";
-const MODEL_REPO: &str = "TinyLlama-1.1B-Chat-v0.3-GGUF";
-const MODEL_FILE: &str = "tinyllama-1.1b-chat-v0.3.Q4_K_M.gguf";
-
+const MODEL_REPO: &str = "TinyLlama-1.1B-Chat-v1.0-GGUF";
+const MODEL_FILE: &str = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+/*
 const TOKENIZER_USER: &str = "hf-internal-testing";
 const TOKENIZER_REPO: &str = "llama-tokenizer";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 // const TOKENIZER_FILE: &str = "tokenizer.model";
+*/
+/*
+//blob/main/tokenizer.json
+*/
+const TOKENIZER_USER: &str = "TinyLlama";
+const TOKENIZER_REPO: &str = "TinyLlama-1.1B-Chat-v1.0";
+const TOKENIZER_FILE: &str = "tokenizer.json";
 
 #[derive(Debug, Clone)]
 pub enum ChatMessage {
@@ -59,6 +66,8 @@ pub enum ChatMessage {
 
     Input(String),
     SubmitInput,
+
+    RunModelError(Arc<anyhow::Error>),
 
     CloseErrorModal,
 }
@@ -215,8 +224,17 @@ impl ChatTab {
                 self.input = input;
             }
             ChatMessage::SubmitInput => {
-                self.history.push(("User".into(), self.input.clone()));
+                let input = self.input.clone();
                 self.input.clear();
+
+                self.history.push(("User".into(), input));
+
+                return run_model(self.model_runner.clone());
+            }
+            ChatMessage::RunModelError(error) => {
+                error!("{error:?}");
+                self.error = Some(error);
+                // TODO: Clear run model flag
             }
             ChatMessage::CloseErrorModal => {
                 self.error = None;
@@ -447,6 +465,23 @@ fn load_model(
             Err(error) => {
                 let _ = channel
                     .send(ChatMessage::LoadModelError(Arc::new(error)))
+                    .await
+                    .is_ok();
+            }
+        }
+    })
+}
+
+fn run_model(model_runner: ModelRunner) -> Command<ChatMessage> {
+    iced::command::channel(100, move |mut channel| async move {
+        let result = model_runner
+            .run_model("Hello, how are you today?".into())
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(error) => {
+                let _ = channel
+                    .send(ChatMessage::RunModelError(Arc::new(error)))
                     .await
                     .is_ok();
             }
