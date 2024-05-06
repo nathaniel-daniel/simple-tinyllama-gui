@@ -8,11 +8,17 @@ use candle_core::Tensor;
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::generation::Sampling;
 use candle_transformers::models::quantized_llama::ModelWeights;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
 use tracing::info;
+
+type ProgressHandler = Box<
+    dyn FnMut(String) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync + 'static,
+>;
 
 enum Message {
     LoadModel {
@@ -22,6 +28,7 @@ enum Message {
     },
     RunModel {
         prompt: Box<str>,
+        progress_handler: ProgressHandler,
         tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
 }
@@ -57,10 +64,24 @@ impl ModelRunner {
         rx.await?
     }
 
-    pub async fn run_model(&self, prompt: Box<str>) -> anyhow::Result<()> {
+    pub async fn run_model<F, FU>(
+        &self,
+        prompt: Box<str>,
+        mut progress_handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(String) -> FU + Send + Sync + 'static,
+        FU: Future<Output = ()> + Send + 'static,
+    {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.tx.send(Message::RunModel { prompt, tx }).await?;
+        self.tx
+            .send(Message::RunModel {
+                prompt,
+                progress_handler: Box::new(move |token| Box::pin((progress_handler)(token))),
+                tx,
+            })
+            .await?;
 
         rx.await?
     }
@@ -86,8 +107,12 @@ fn task(mut rx: tokio::sync::mpsc::Receiver<Message>) {
                 });
                 let _ = tx.send(result).is_ok();
             }
-            Message::RunModel { prompt, tx } => {
-                let result = run_model(loaded_model.as_mut(), &prompt);
+            Message::RunModel {
+                prompt,
+                progress_handler,
+                tx,
+            } => {
+                let result = run_model(loaded_model.as_mut(), &prompt, progress_handler);
                 let _ = tx.send(result).is_ok();
             }
         }
@@ -137,41 +162,34 @@ struct LoadedModel {
     token_output_stream: TokenOutputStream,
 }
 
-fn run_model(model: Option<&mut LoadedModel>, prompt: &str) -> anyhow::Result<()> {
-    let sample_len: usize = 1024;
+fn run_model(
+    model: Option<&mut LoadedModel>,
+    prompt: &str,
+    mut progress_handler: ProgressHandler,
+) -> anyhow::Result<()> {
+    let sample_len: usize = 256;
     let temperature: f64 = 0.7;
-    let top_p = Some(0.9);
+    let top_p = Some(0.95);
     let top_k = Some(50);
     let seed = 1234;
-    let repeat_penalty: f32 = 1.1;
+    let repeat_penalty: f32 = 1.0;
     let repeat_last_n = 64;
 
     let device = Device::Cpu;
 
     let model = model.context("missing model")?;
-    /*
-    let prompt = {
-        // ChatML
-        // https://github.com/openai/openai-python/blob/release-v0.28.0/chatml.md
-        let mut formatted = String::new();
-        formatted.push_str("<|im_start|>system\n");
-        formatted.push_str(prompt);
-        formatted.push_str("<|im_end|>\n");
-        formatted.push_str("<|im_start|>assistant\n");
-        formatted
-    };*/
     let prompt = {
         let mut formatted = String::new();
         formatted.push_str("<|system|>\n");
-        formatted.push_str("You are a friendly assistant.</s>");
+        formatted.push_str("You are a friendly chatbot who always responds in the style of a pirate</s>\n");
         formatted.push_str("<|user|>\n");
         formatted.push_str(prompt);
-        formatted.push_str("</s>");
+        formatted.push_str("</s>\n");
         formatted.push_str("<|assistant|>\n");
         formatted
     };
-    
-    println!("{prompt}");
+
+    info!("Prompt: {prompt}");
 
     let tokens = model
         .token_output_stream
@@ -225,18 +243,15 @@ fn run_model(model: Option<&mut LoadedModel>, prompt: &str) -> anyhow::Result<()
 
         let next_token = logits_processor.sample(&logits)?;
         all_tokens.push(next_token);
-        
+
         if next_token == eos_token {
             break;
         }
 
-        dbg!(next_token);
         if let Some(t) = model.token_output_stream.next_token(next_token)? {
-            dbg!(t);
+            futures::executor::block_on((progress_handler)(t));
         }
     }
-    
-    dbg!("done");
 
     Ok(())
 }

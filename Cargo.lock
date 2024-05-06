@@ -3255,6 +3255,7 @@ dependencies = [
  "candle-core",
  "candle-transformers",
  "dirs",
+ "futures",
  "iced",
  "iced_aw",
  "nd-util",

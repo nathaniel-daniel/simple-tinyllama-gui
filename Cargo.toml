@@ -8,6 +8,7 @@ anyhow = "1.0.82"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.5.1" }
 candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.5.1" }
 dirs = "5.0.1"
+futures = { version = "0.3.30", default-features = false }
 iced = { version = "0.12.1", features = [ "tokio" ] }
 # iced_aw = { version = "0.8.0", features = [ "tabs" ] }
 iced_aw = { git = "https://github.com/iced-rs/iced_aw", features = [ "tabs" ] }

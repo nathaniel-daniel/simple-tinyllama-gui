@@ -29,16 +29,14 @@ const DEFAULT_PADDING: f32 = 5.0;
 
 const MODEL_USER: &str = "TheBloke";
 const MODEL_REPO: &str = "TinyLlama-1.1B-Chat-v1.0-GGUF";
-const MODEL_FILE: &str = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+const MODEL_FILE: &str = "tinyllama-1.1b-chat-v1.0.Q5_K_M.gguf";
 /*
 const TOKENIZER_USER: &str = "hf-internal-testing";
 const TOKENIZER_REPO: &str = "llama-tokenizer";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 // const TOKENIZER_FILE: &str = "tokenizer.model";
 */
-/*
-//blob/main/tokenizer.json
-*/
+
 const TOKENIZER_USER: &str = "TinyLlama";
 const TOKENIZER_REPO: &str = "TinyLlama-1.1B-Chat-v1.0";
 const TOKENIZER_FILE: &str = "tokenizer.json";
@@ -68,6 +66,8 @@ pub enum ChatMessage {
     SubmitInput,
 
     RunModelError(Arc<anyhow::Error>),
+    RunModelProgress(String),
+    RunModelOk,
 
     CloseErrorModal,
 }
@@ -88,6 +88,7 @@ pub struct ChatTab {
 
     loaded_model: bool,
     loading_model: bool,
+    running_model: bool,
 
     error: Option<Arc<anyhow::Error>>,
 }
@@ -113,6 +114,7 @@ impl ChatTab {
 
                 loaded_model: false,
                 loading_model: false,
+                running_model: false,
 
                 error: None,
             },
@@ -227,14 +229,25 @@ impl ChatTab {
                 let input = self.input.clone();
                 self.input.clear();
 
-                self.history.push(("User".into(), input));
+                self.history.push(("User".into(), input.clone()));
+                self.history.push(("AI".into(), String::new()));
+                
+                self.running_model = true;
 
-                return run_model(self.model_runner.clone());
+                return run_model(self.model_runner.clone(), input.into());
             }
             ChatMessage::RunModelError(error) => {
                 error!("{error:?}");
                 self.error = Some(error);
-                // TODO: Clear run model flag
+                self.running_model = false;
+            }
+            ChatMessage::RunModelProgress(token) => {
+                if let Some((_user, message)) = self.history.last_mut() {
+                    message.push_str(token.as_str());
+                }
+            }
+            ChatMessage::RunModelOk => {
+                self.running_model = false;
             }
             ChatMessage::CloseErrorModal => {
                 self.error = None;
@@ -345,7 +358,7 @@ impl Tab for ChatTab {
             .height(Length::Fill);
 
         let mut text_input = TextInput::new("Start chatting...", &self.input);
-        if self.model_path.is_some() {
+        if self.model_path.is_some() && self.tokenizer_path.is_some() && self.loaded_model && !self.running_model {
             text_input = text_input
                 .on_input(ChatMessage::Input)
                 .on_submit(ChatMessage::SubmitInput);
@@ -472,13 +485,29 @@ fn load_model(
     })
 }
 
-fn run_model(model_runner: ModelRunner) -> Command<ChatMessage> {
+fn run_model(model_runner: ModelRunner, input: Box<str>) -> Command<ChatMessage> {
     iced::command::channel(100, move |mut channel| async move {
-        let result = model_runner
-            .run_model("Hello, how are you today?".into())
-            .await;
+        let result = {
+            let channel = channel.clone();
+            model_runner
+                .run_model(input, move |token| {
+                    let mut channel = channel.clone();
+                    async move {
+                        let _ = channel
+                            .send(ChatMessage::RunModelProgress(token))
+                            .await
+                            .is_ok();
+                    }
+                })
+                .await
+        };
         match result {
-            Ok(_) => {}
+            Ok(_) => {
+                let _ = channel
+                    .send(ChatMessage::RunModelOk)
+                    .await
+                    .is_ok();
+            }
             Err(error) => {
                 let _ = channel
                     .send(ChatMessage::RunModelError(Arc::new(error)))
