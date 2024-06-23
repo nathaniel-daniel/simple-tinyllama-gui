@@ -1,19 +1,19 @@
-mod token_output_stream;
-
-use self::token_output_stream::TokenOutputStream;
 use anyhow::ensure;
 use anyhow::Context;
-use candle_core::Device;
-use candle_core::Tensor;
-use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::generation::Sampling;
-use candle_transformers::models::quantized_llama::ModelWeights;
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::AddBos;
+use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::Special;
+use llama_cpp_2::token::data_array::LlamaTokenDataArray;
 use std::future::Future;
+use std::num::NonZero;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
-use tokenizers::Tokenizer;
 use tracing::info;
 
 type ProgressHandler = Box<
@@ -125,45 +125,30 @@ fn load_model(
 ) -> anyhow::Result<LoadedModel> {
     let start_time = Instant::now();
 
-    let device = Device::Cpu;
+    let backend = LlamaBackend::init().context("failed to init llama-cpp")?;
+    let model_params = LlamaModelParams::default();
 
     info!("loading model \"{}\"", model_path.display());
 
     let model_path_extension = model_path.extension().context("missing extension")?;
     ensure!(model_path_extension == "gguf");
 
-    let mut file = std::fs::File::open(&*model_path).context("failed to open model path")?;
-    let model = candle_core::quantized::gguf_file::Content::read(&mut file)?;
-    let model_weights = ModelWeights::from_gguf(model, &mut file, &device)
-        .context("failed to load model weights")?;
+    let model = LlamaModel::load_from_file(&backend, &*model_path, &model_params)
+        .context("failed to load model")?;
 
     let model_end_time = Instant::now();
     info!("loaded model in {:?}", model_end_time - start_time);
 
-    let tokenizer = Tokenizer::from_file(&*tokenizer_path)
-        .map_err(anyhow::Error::msg)
-        .context("failed to load tokenizer")?;
-    let tokenizer_end_time = Instant::now();
-    info!(
-        "loaded tokenizer in {:?}",
-        tokenizer_end_time - model_end_time
-    );
-
-    let token_output_stream = TokenOutputStream::new(tokenizer);
-
-    Ok(LoadedModel {
-        model_weights,
-        token_output_stream,
-    })
+    Ok(LoadedModel { backend, model })
 }
 
 struct LoadedModel {
-    model_weights: ModelWeights,
-    token_output_stream: TokenOutputStream,
+    backend: LlamaBackend,
+    model: LlamaModel,
 }
 
 fn run_model(
-    model: Option<&mut LoadedModel>,
+    loaded_model: Option<&mut LoadedModel>,
     prompt: &str,
     mut progress_handler: ProgressHandler,
 ) -> anyhow::Result<()> {
@@ -175,19 +160,101 @@ fn run_model(
     let repeat_penalty: f32 = 1.0;
     let repeat_last_n = 64;
 
-    let device = Device::Cpu;
-
-    let model = model.context("missing model")?;
+    let n_len = 256;
+    let loaded_model = loaded_model.context("missing model")?;
+    
     let prompt = {
         let mut formatted = String::new();
         formatted.push_str("<|system|>\n");
-        formatted.push_str("You are a friendly chatbot who always responds in the style of a pirate</s>\n");
+        formatted.push_str(
+            "You are a friendly chatbot who always responds in the style of a pirate</s>\n",
+        );
         formatted.push_str("<|user|>\n");
         formatted.push_str(prompt);
         formatted.push_str("</s>\n");
         formatted.push_str("<|assistant|>\n");
         formatted
     };
+
+    let mut ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZero::new(2048))
+        .with_seed(1234);
+    let mut ctx = loaded_model
+        .model
+        .new_context(&loaded_model.backend, ctx_params)
+        .context("failed to create llama context")?;
+
+    let tokens_list = loaded_model
+        .model
+        .str_to_token(&prompt, AddBos::Always)
+        .with_context(|| format!("failed to tokenize {prompt}"))?;
+
+    let n_cxt = ctx.n_ctx() as i32;
+    let n_kv_req = tokens_list.len() as i32 + (n_len - tokens_list.len() as i32);
+
+    ensure!(
+        n_kv_req <= n_cxt,
+        "the required kv cache size is not big enough"
+    );
+    ensure!(
+        tokens_list.len() < usize::try_from(n_len)?,
+        "the prompt is too long, it has more tokens than n_len"
+    );
+
+    let mut batch = LlamaBatch::new(512, 1);
+
+    let last_index: i32 = (tokens_list.len() - 1) as i32;
+    for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
+        // llama_decode will output logits only for the last token of the prompt
+        let is_last = i == last_index;
+        batch.add(token, i, &[0], is_last)?;
+    }
+
+    ctx.decode(&mut batch)
+        .with_context(|| "llama_decode() failed")?;
+
+    let mut n_cur = batch.n_tokens();
+    let mut n_decode = 0;
+
+    let generate_start_time = Instant::now();
+
+    while n_cur <= n_len {
+        // sample the next token
+        {
+            let candidates = ctx.candidates_ith(batch.n_tokens() - 1);
+
+            let candidates_p = LlamaTokenDataArray::from_iter(candidates, false);
+
+            // sample the most likely token
+            let new_token_id = ctx.sample_token_greedy(candidates_p);
+
+            // is it an end of stream?
+            if new_token_id == loaded_model.model.token_eos() {
+                break;
+            }
+
+            let output_bytes = loaded_model
+                .model
+                .token_to_bytes(new_token_id, Special::Tokenize)?;
+            let output_string = String::from_utf8(output_bytes)?;
+
+            futures::executor::block_on((progress_handler)(output_string));
+
+            batch.clear();
+            batch.add(new_token_id, n_cur, &[0], true)?;
+        }
+
+        n_cur += 1;
+
+        ctx.decode(&mut batch).with_context(|| "failed to eval")?;
+
+        n_decode += 1;
+    }
+    /*
+    let device = Device::Cpu;
+
+    let model = model.context("missing model")?;
+    
 
     info!("Prompt: {prompt}");
 
@@ -252,6 +319,7 @@ fn run_model(
             futures::executor::block_on((progress_handler)(t));
         }
     }
+    */
 
     Ok(())
 }

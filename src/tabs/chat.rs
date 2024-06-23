@@ -231,7 +231,7 @@ impl ChatTab {
 
                 self.history.push(("User".into(), input.clone()));
                 self.history.push(("AI".into(), String::new()));
-                
+
                 self.running_model = true;
 
                 return run_model(self.model_runner.clone(), input.into());
@@ -358,7 +358,11 @@ impl Tab for ChatTab {
             .height(Length::Fill);
 
         let mut text_input = TextInput::new("Start chatting...", &self.input);
-        if self.model_path.is_some() && self.tokenizer_path.is_some() && self.loaded_model && !self.running_model {
+        if self.model_path.is_some()
+            && self.tokenizer_path.is_some()
+            && self.loaded_model
+            && !self.running_model
+        {
             text_input = text_input
                 .on_input(ChatMessage::Input)
                 .on_submit(ChatMessage::SubmitInput);
@@ -503,10 +507,7 @@ fn run_model(model_runner: ModelRunner, input: Box<str>) -> Command<ChatMessage>
         };
         match result {
             Ok(_) => {
-                let _ = channel
-                    .send(ChatMessage::RunModelOk)
-                    .await
-                    .is_ok();
+                let _ = channel.send(ChatMessage::RunModelOk).await.is_ok();
             }
             Err(error) => {
                 let _ = channel
